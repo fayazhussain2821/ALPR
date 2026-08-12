@@ -178,6 +178,8 @@ class Pipeline:
         tracker, voter = fresh()
         stats = PipelineStats()
         timings: dict[str, float] = {"detect": 0.0, "ocr": 0.0, "log": 0.0}
+        # A folder of stills names each frame; a video names the whole run.
+        origin = source.name
 
         started = time.time()
         with ExcelLog(out, cooldown=config.cooldown) as log:
@@ -185,6 +187,7 @@ class Pipeline:
                 if max_frames is not None and stats.frames >= max_frames:
                     break
                 stats.frames += 1
+                origin = frame.source_name or source.name
 
                 mark = time.time()
                 detections = self.detector.detect(frame.image, confidence=config.confidence)
@@ -212,7 +215,7 @@ class Pipeline:
                     timings["ocr"] += time.time() - mark
 
                 mark = time.time()
-                self._emit(tracker, voter, log, stats, frame.timestamp, source.name)
+                self._emit(tracker, voter, log, stats, frame.timestamp, origin)
                 timings["log"] += time.time() - mark
 
                 if stills:
@@ -221,7 +224,7 @@ class Pipeline:
                     # into the next photograph, which would otherwise link two
                     # different cars that happen to sit in similar positions.
                     tracker.finish()
-                    self._emit(tracker, voter, log, stats, frame.timestamp, source.name)
+                    self._emit(tracker, voter, log, stats, frame.timestamp, origin)
                     tracker, voter = fresh()
 
                 if on_frame is not None:
@@ -234,7 +237,7 @@ class Pipeline:
                         break
 
             tracker.finish()
-            self._emit(tracker, voter, log, stats, time.time(), source.name)
+            self._emit(tracker, voter, log, stats, time.time(), origin)
             stats.suppressed = log.suppressed
 
         stats.elapsed = time.time() - started

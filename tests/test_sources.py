@@ -204,6 +204,23 @@ class TestImageSource:
         cv2.imwrite(str(path), np.full((120, 200, 3), shade, dtype=np.uint8))
         return path
 
+    def test_every_frame_names_its_file(self, tmp_path):
+        # Without this a batch logs each plate against "3 images" and the
+        # photograph it came from is unrecoverable.
+        from alpr.sources import ImageSource
+
+        paths = [
+            self._photo(tmp_path / f"{n}.jpg", shade=s)
+            for n, s in zip("abc", (60, 90, 120), strict=True)
+        ]
+        source = ImageSource(paths)
+        assert [f.source_name for f in source.frames()] == ["a.jpg", "b.jpg", "c.jpg"]
+
+    def test_a_video_frame_has_no_per_frame_name(self, tmp_path):
+        # A video is one file for the whole run; the source name stands.
+        source = VideoFileSource(write_video(tmp_path / "clip.mp4", frames=3))
+        assert all(f.source_name is None for f in source.frames())
+
     def test_a_single_image_file(self, tmp_path):
         from alpr.sources import ImageSource
 

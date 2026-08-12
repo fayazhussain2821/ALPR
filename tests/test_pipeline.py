@@ -7,6 +7,8 @@ survivors reach the log — not that YOLO or PaddleOCR work.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -185,6 +187,11 @@ class StillSource(FakeSource):
     def is_still(self) -> bool:
         return True
 
+    def frames(self):
+        for frame in super().frames():
+            # A real ImageSource names every frame after its file.
+            yield replace(frame, source_name=f"photo{frame.index}.jpg")
+
 
 class AlwaysDetects:
     """A plate in the same place in every image — the contamination trap."""
@@ -227,6 +234,30 @@ class TestStillImages:
         assert stats.tracks_completed == 3, "images were merged into one track"
         assert stats.logged == 3
         assert {r["Plate"] for r in read_workbook(out)} == {"AAA111", "BBB222", "CCC333"}
+
+    def test_each_row_names_the_photo_it_came_from(self, tmp_path):
+        # Provenance is the whole point of a batch run. Logging three plates
+        # against "3 images" leaves no way back to the photograph, which is
+        # exactly what someone reviewing a batch needs.
+        pipeline = Pipeline(
+            AlwaysDetects(),
+            FakeReader(["AAA111", "BBB222", "CCC333"]),
+            PipelineConfig(),
+        )
+        out = tmp_path / "log.xlsx"
+        pipeline.run(StillSource(3), out)
+
+        rows = {r["Plate"]: r["Source"] for r in read_workbook(out)}
+        assert rows == {
+            "AAA111": "photo0.jpg",
+            "BBB222": "photo1.jpg",
+            "CCC333": "photo2.jpg",
+        }
+
+    def test_video_rows_still_name_the_clip(self, tmp_path):
+        # A video's frames carry no per-frame name, so the source name stands.
+        _, rows = run(tmp_path, ["MH12AB1234"], ocr_every=1)
+        assert rows[0]["Source"] == "fake.mp4"
 
     def test_video_still_merges_frames_into_one_track(self, tmp_path):
         # The counterpart: on video the same three reads are one vehicle.

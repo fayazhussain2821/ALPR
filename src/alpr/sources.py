@@ -52,6 +52,12 @@ class Frame:
     image: Any
     timestamp: float
 
+    # Which file this frame came from, when that differs frame to frame.
+    # A video has one name for the whole run and leaves this unset; a folder
+    # of stills has a different one per frame, and losing it would log every
+    # plate against "24 images" with no way back to the photograph.
+    source_name: str | None = None
+
     @property
     def shape(self) -> tuple[int, int]:
         """(height, width) in pixels."""
@@ -378,7 +384,12 @@ class ImageSource(FrameSource):
                 # A directory can hold a file with an image extension that is
                 # not decodable; skipping beats aborting a batch.
                 continue
-            yield Frame(index=index, image=image, timestamp=time.time())
+            yield Frame(
+                index=index,
+                image=image,
+                timestamp=time.time(),
+                source_name=path.name,
+            )
 
     def close(self) -> None:
         pass
