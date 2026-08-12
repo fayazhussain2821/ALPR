@@ -177,7 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--source",
         required=True,
-        help="video path, camera index (0), or rtsp:// url",
+        help=(
+            "video path, image, folder of images, camera index (0), or rtsp:// url. "
+            "Images are treated as unrelated stills: each is scored on its own, "
+            "without the multi-frame voting that video gets"
+        ),
     )
     run_cmd.add_argument("--out", default="plates.xlsx", help="Excel log to write")
     run_cmd.add_argument("--weights", default="best.pt", help="trained detector weights")

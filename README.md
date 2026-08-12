@@ -195,11 +195,11 @@ that `B` as an `8`. Both halves of that trade are in the test suite.
 ## Pipeline
 
 ```
-video/camera ──▶ FrameSource ──▶ Detector ──▶ Tracker ──▶ per-track crop buffer
-                 (file/cam/rtsp)   (YOLO)      (IoU)             │
-                                                                   ▼
-   Excel log ◀── Deduplicator ◀── Validator ◀── Voter ◀────────── OCR
-   (openpyxl)    (cooldown)       (IN / DE)   (multi-frame)   (PaddleOCR)
+source ──▶ FrameSource ──▶ Detector ──▶ Tracker ────────▶ per-track crop buffer
+(file/img/dir/cam/rtsp)    (YOLO)       (IoU)                       │
+                                                                    ▼
+   Excel log ◀── Deduplicator ◀── Validator ◀── Voter ◀─────────── OCR
+   (openpyxl)    (cooldown)       (IN / DE)     (multi-frame)      (PaddleOCR)
 ```
 
 Three design decisions shape everything else.
@@ -316,7 +316,23 @@ three frames keeps the vote strong and the loop real-time.
 alpr run --source 0 --weights best.pt --out plates.xlsx     # webcam
 alpr run --source rtsp://camera.local/stream --region DE    # network camera
 alpr run --source clip.mp4 --ocr-every 1                    # offline, most accurate
+alpr run --source photo.jpg                                 # one still image
+alpr run --source photos/                                   # a folder of stills
 ```
+
+### Stills are not video, and score lower
+
+A single image is accepted, but it is worth knowing what it gives up.
+
+Tracking and voting exist because consecutive video frames show the *same* vehicle, so forty
+imperfect reads collapse into one confident answer. A photograph offers exactly one read. There
+is nothing to vote on, and the number you get is **raw OCR accuracy** rather than the voted
+figure quoted above.
+
+Two things change automatically for stills. The confirmation thresholds drop to 1, because
+`min_hits=3` would otherwise confirm no track at all and log nothing. And the tracker is rebuilt
+between images — across unrelated photographs it would otherwise link two different cars that
+happen to sit in similar positions and vote their plates together.
 
 ---
 
