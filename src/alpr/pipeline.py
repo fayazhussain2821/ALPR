@@ -59,6 +59,22 @@ class PipelineConfig:
     # Detection.
     confidence: float = 0.25
 
+    def for_stills(self) -> PipelineConfig:
+        """The same settings, adjusted for unrelated still images.
+
+        Tracking and voting assume consecutive frames show the same vehicle.
+        A still gives them nothing: a plate appears once, so `min_hits=3`
+        would confirm no track at all and nothing would ever be logged. These
+        thresholds drop to 1 so a single sighting counts.
+
+        This is a genuine loss, not a free switch. Voting across frames is a
+        large part of the pipeline's accuracy, and on one image there is
+        nothing to vote on — the result is raw OCR accuracy.
+        """
+        from dataclasses import replace
+
+        return replace(self, min_hits=1, min_reads=1, ocr_every=1)
+
     def __post_init__(self) -> None:
         if self.ocr_every < 1:
             raise ValueError(f"ocr_every must be at least 1, got {self.ocr_every}")
@@ -150,9 +166,16 @@ class Pipeline:
         """
         from PIL import Image
 
-        config = self.config
-        tracker = Tracker(min_hits=config.min_hits, max_age=config.max_age)
-        voter = TrackVoter(min_reads=config.min_reads)
+        stills = getattr(source, "is_still", False)
+        config = self.config.for_stills() if stills else self.config
+
+        def fresh():
+            return (
+                Tracker(min_hits=config.min_hits, max_age=config.max_age),
+                TrackVoter(min_reads=config.min_reads),
+            )
+
+        tracker, voter = fresh()
         stats = PipelineStats()
         timings: dict[str, float] = {"detect": 0.0, "ocr": 0.0, "log": 0.0}
 
@@ -191,6 +214,15 @@ class Pipeline:
                 mark = time.time()
                 self._emit(tracker, voter, log, stats, frame.timestamp, source.name)
                 timings["log"] += time.time() - mark
+
+                if stills:
+                    # Each still is its own scene. Closing the tracker here
+                    # emits this image's plates and guarantees nothing carries
+                    # into the next photograph, which would otherwise link two
+                    # different cars that happen to sit in similar positions.
+                    tracker.finish()
+                    self._emit(tracker, voter, log, stats, frame.timestamp, source.name)
+                    tracker, voter = fresh()
 
                 if on_frame is not None:
                     texts = {}

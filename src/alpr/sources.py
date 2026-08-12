@@ -28,10 +28,12 @@ from __future__ import annotations
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 
 DEFAULT_RECONNECT_DELAY = 1.0
 MAX_RECONNECT_DELAY = 30.0
@@ -71,6 +73,18 @@ class FrameSource(ABC):
     @property
     def is_live(self) -> bool:
         """Live sources drop frames to stay current; files do not."""
+        return False
+
+    @property
+    def is_still(self) -> bool:
+        """True when consecutive frames are unrelated images, not a sequence.
+
+        This changes the pipeline's meaning entirely. Tracking and voting exist
+        because consecutive video frames show the *same* vehicle; across
+        unrelated stills they would link different cars that happen to occupy
+        similar positions, and vote their readings together. A still source
+        must therefore be processed one image at a time.
+        """
         return False
 
     def __enter__(self):
@@ -328,6 +342,54 @@ class RtspSource(CameraSource):
         return self._capture.reconnects if self._capture else 0
 
 
+class ImageSource(FrameSource):
+    """Still images: one file, or every image in a directory.
+
+    Each image is an independent scene. The pipeline resets its tracker
+    between them, so nothing is carried from one photograph to the next.
+
+    The cost is real and worth stating: a single image gives multi-frame
+    voting nothing to work with, so accuracy is raw OCR accuracy rather than
+    the voted figure. Stills are a convenience, not the mode this pipeline is
+    designed around.
+    """
+
+    def __init__(self, paths: Sequence[str | Path] | str | Path) -> None:
+        if isinstance(paths, str | Path):
+            paths = [paths]
+        self.paths = [Path(p) for p in paths]
+        missing = [p for p in self.paths if not p.exists()]
+        if missing:
+            raise SourceError(f"image not found: {missing[0]}")
+        if not self.paths:
+            raise SourceError("no images given")
+        self.name = self.paths[0].name if len(self.paths) == 1 else f"{len(self.paths)} images"
+
+    @property
+    def is_still(self) -> bool:
+        return True
+
+    def frames(self) -> Iterator[Frame]:
+        import cv2
+
+        for index, path in enumerate(self.paths):
+            image = cv2.imread(str(path))
+            if image is None:
+                # A directory can hold a file with an image extension that is
+                # not decodable; skipping beats aborting a batch.
+                continue
+            yield Frame(index=index, image=image, timestamp=time.time())
+
+    def close(self) -> None:
+        pass
+
+
+def _images_in(directory: Path) -> list[Path]:
+    return sorted(
+        p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
 def open_source(spec: str | int | Path, **kwargs) -> FrameSource:
     """Build the right source for a spec.
 
@@ -343,4 +405,14 @@ def open_source(spec: str | int | Path, **kwargs) -> FrameSource:
         return CameraSource(int(text), **kwargs)
     if text.startswith(("rtsp://", "rtsps://", "http://", "https://")):
         return RtspSource(text, **kwargs)
+
+    path = Path(text)
+    if path.is_dir():
+        images = _images_in(path)
+        if not images:
+            raise SourceError(f"no images in {path}")
+        return ImageSource(images)
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        return ImageSource(path)
+
     return VideoFileSource(text)
