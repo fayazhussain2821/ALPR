@@ -195,3 +195,67 @@ def test_real_webcam():
     with CameraSource(0) as source:
         frame = next(iter(source))
         assert frame.image is not None
+
+
+class TestImageSource:
+    def _photo(self, path, shade=90):
+        import cv2
+
+        cv2.imwrite(str(path), np.full((120, 200, 3), shade, dtype=np.uint8))
+        return path
+
+    def test_a_single_image_file(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        source = ImageSource(self._photo(tmp_path / "a.jpg"))
+        frames = list(source.frames())
+        assert len(frames) == 1
+        assert source.is_still is True
+
+    def test_open_source_recognises_an_image(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        path = self._photo(tmp_path / "a.png")
+        assert isinstance(open_source(str(path)), ImageSource)
+
+    def test_open_source_recognises_a_directory(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        for i in range(3):
+            self._photo(tmp_path / f"{i}.jpg")
+        source = open_source(str(tmp_path))
+        assert isinstance(source, ImageSource)
+        assert len(list(source.frames())) == 3
+
+    def test_directory_images_are_ordered(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        for i in (2, 0, 1):
+            self._photo(tmp_path / f"{i}.jpg")
+        source = ImageSource(sorted(tmp_path.glob("*.jpg")))
+        assert [f.index for f in source.frames()] == [0, 1, 2]
+
+    def test_video_is_not_treated_as_stills(self, tmp_path):
+        path = write_video(tmp_path / "clip.mp4", frames=3)
+        assert open_source(str(path)).is_still is False
+
+    def test_undecodable_file_is_skipped_not_fatal(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        good = self._photo(tmp_path / "good.jpg")
+        bad = tmp_path / "bad.jpg"
+        bad.write_bytes(b"not an image")
+        # A directory can hold a file with an image extension that will not
+        # decode; skipping beats aborting a batch part-way through.
+        assert len(list(ImageSource([good, bad]).frames())) == 1
+
+    def test_missing_image_raises(self, tmp_path):
+        from alpr.sources import ImageSource
+
+        with pytest.raises(SourceError, match="not found"):
+            ImageSource(tmp_path / "absent.jpg")
+
+    def test_empty_directory_raises(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        with pytest.raises(SourceError, match="no images"):
+            open_source(str(tmp_path / "empty"))

@@ -174,3 +174,66 @@ class TestConfig:
     def test_rejects_zero_ocr_interval(self):
         with pytest.raises(ValueError, match="ocr_every"):
             PipelineConfig(ocr_every=0)
+
+
+class StillSource(FakeSource):
+    """Unrelated photographs rather than a video sequence."""
+
+    name = "photos"
+
+    @property
+    def is_still(self) -> bool:
+        return True
+
+
+class AlwaysDetects:
+    """A plate in the same place in every image — the contamination trap."""
+
+    def detect(self, image, **kwargs):
+        return [Detection(0.30, 0.55, 0.42, 0.60, 0.92)]
+
+
+class TestStillImages:
+    def test_config_relaxes_for_stills(self):
+        config = PipelineConfig(min_hits=3, min_reads=2, ocr_every=3).for_stills()
+        # A plate appears once in a still; the video thresholds would confirm
+        # no track at all and nothing would ever be logged.
+        assert (config.min_hits, config.min_reads, config.ocr_every) == (1, 1, 1)
+
+    def test_config_is_unchanged_for_video(self, tmp_path):
+        stats, rows = run(tmp_path, ["MH12AB1234"], ocr_every=1)
+        assert stats.logged == 1  # video path still works
+
+    def test_a_single_still_is_logged(self, tmp_path):
+        pipeline = Pipeline(AlwaysDetects(), FakeReader(["MH12AB1234"]), PipelineConfig())
+        out = tmp_path / "log.xlsx"
+        stats = pipeline.run(StillSource(1), out)
+        assert stats.logged == 1
+        assert read_workbook(out)[0]["Plate"] == "MH12AB1234"
+
+    def test_each_still_is_independent(self, tmp_path):
+        # The trap: the same box position in consecutive images. On video that
+        # is one car; across unrelated photos it is three different cars, and
+        # merging them would vote three plates into one.
+        pipeline = Pipeline(
+            AlwaysDetects(),
+            FakeReader(["AAA111", "BBB222", "CCC333"]),
+            PipelineConfig(),
+        )
+        out = tmp_path / "log.xlsx"
+        stats = pipeline.run(StillSource(3), out)
+
+        assert stats.frames == 3
+        assert stats.tracks_completed == 3, "images were merged into one track"
+        assert stats.logged == 3
+        assert {r["Plate"] for r in read_workbook(out)} == {"AAA111", "BBB222", "CCC333"}
+
+    def test_video_still_merges_frames_into_one_track(self, tmp_path):
+        # The counterpart: on video the same three reads are one vehicle.
+        pipeline = Pipeline(
+            AlwaysDetects(),
+            FakeReader(["MH12AB1234"]),
+            PipelineConfig(min_hits=1, min_reads=1, ocr_every=1),
+        )
+        stats = pipeline.run(FakeSource(3), tmp_path / "log.xlsx")
+        assert stats.tracks_completed == 1
