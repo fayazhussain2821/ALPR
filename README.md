@@ -3,7 +3,7 @@
 Detects license plates in video, reads them, validates them against Indian and German plate
 grammars, and logs **one deduplicated row per vehicle** to an Excel workbook.
 
-[![CI](https://github.com/fayazhussain2821/ALPR/actions/workflows/ci.yml/badge.svg)](https://github.com/fayazhussain2821/ALPR/actions/workflows/ci.yml)
+[![CI](https://github.com/fayazhussain2821/Automatic-License-Plate-Recognition/actions/workflows/ci.yml/badge.svg)](https://github.com/fayazhussain2821/Automatic-License-Plate-Recognition/actions/workflows/ci.yml)
 [![Model on HF](https://img.shields.io/badge/%F0%9F%A4%97%20model-alpr--plate--detector-yellow)](https://huggingface.co/Babblu2821/alpr-plate-detector)
 
 ---

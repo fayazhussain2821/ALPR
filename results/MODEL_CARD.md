@@ -13,7 +13,8 @@ pipeline_tag: object-detection
 # ALPR plate detector (YOLOv8s)
 
 Single-class license plate detector, trained as Phase 2 of
-[fayazhussain2821/ALPR](https://github.com/fayazhussain2821/ALPR) — an end-to-end pipeline that
+[fayazhussain2821/Automatic-License-Plate-Recognition](https://github.com/fayazhussain2821/Automatic-License-Plate-Recognition)
+— an end-to-end pipeline that
 detects plates in video, reads them, validates them against Indian and German plate grammars, and
 logs one deduplicated row per vehicle to an Excel workbook.
 
@@ -73,7 +74,7 @@ upside down), and rotation and perspective *enabled* (Ultralytics defaults both 
 under-trains the variation this task actually has).
 
 Full arguments are in
-[`results/args.yaml`](https://github.com/fayazhussain2821/ALPR/blob/main/results/args.yaml).
+[`results/args.yaml`](https://github.com/fayazhussain2821/Automatic-License-Plate-Recognition/blob/main/results/args.yaml).
 Ultralytics changes augmentation defaults between minor releases, so reproducing this needs the
 arguments *and* the version that consumed them.
 
