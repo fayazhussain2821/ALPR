@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,12 @@ from alpr.data import (
     write_manifest,
 )
 from alpr.data.stats import DatasetStats, compute_stats
+from alpr.dupes import (
+    DEFAULT_THRESHOLD,
+    DuplicateReport,
+    find_duplicates,
+    regroup_by_duplicates,
+)
 
 
 class BuildError(RuntimeError):
@@ -166,15 +173,91 @@ def ingest_sources(raw_dir: str | Path) -> list[ImageRecord]:
     return records
 
 
+def group_duplicates(
+    records: Sequence[ImageRecord],
+    image_root: str | Path,
+    *,
+    seed: int = 0,
+    threshold: int = DEFAULT_THRESHOLD,
+) -> tuple[list[ImageRecord], DuplicateReport]:
+    """Merge near-duplicate images into shared split groups.
+
+    Filename grouping only catches what a filename admits to. Roboflow exports
+    augmented copies of one photograph under unrelated names, and public
+    datasets get assembled from overlapping sources — neither is visible to a
+    naming rule, and either puts a memorized image in the test split.
+
+    `find_duplicates` wants a `SplitAssignment` because a `DuplicatePair`
+    records which splits it crosses. That is reporting only: the regrouping
+    depends on the pairs, never on which split a pair happened to land in, so a
+    provisional assignment computed from the filename-derived groups cannot
+    influence the outcome. The provisional split is what makes the returned
+    report meaningful — it says how much contamination filename grouping alone
+    would have left behind.
+
+    Args:
+        records: the ingested dataset, before any split is committed to.
+        image_root: root that each record's `file_name` is relative to.
+        seed: seed for the provisional assignment. Does not affect grouping.
+        threshold: Hamming distance below which two images are the same
+            picture. 0 finds only exact matches.
+
+    Returns:
+        The regrouped records, and the audit report for the split they *would*
+        have received without this step.
+    """
+    provisional = split_records(records, seed=seed)
+    report = find_duplicates(records, provisional, image_root, threshold=threshold)
+    return regroup_by_duplicates(records, report), report
+
+
 def build_dataset(
     raw_dir: str | Path = "data/raw",
     out_dir: str | Path = "data/yolo",
     manifest_path: str | Path = "data/manifest.jsonl",
     *,
     seed: int = 0,
+    check_duplicates: bool = True,
+    duplicate_threshold: int = DEFAULT_THRESHOLD,
+    on_duplicates: Callable[[DuplicateReport], None] | None = None,
 ) -> tuple[Path, DatasetStats]:
-    """Ingest, split, verify and export. Returns the data.yaml and the stats."""
+    """Ingest, deduplicate, split, verify and export.
+
+    Duplicate grouping happens **before** the manifest is written, not after.
+    The manifest is the source of truth, so the groups the split is computed
+    from have to be *in* it: anything downstream that does `read_manifest()`
+    then `split_records(seed=...)` — the evaluation notebook does exactly that
+    — must reproduce the same split the exported tree was built with. Applying
+    the regrouping after the manifest would leave those two disagreeing, and
+    the disagreement would show up as an evaluation quietly scored on the
+    wrong images.
+
+    Args:
+        raw_dir: downloaded source exports.
+        out_dir: where the Ultralytics tree goes.
+        manifest_path: where the manifest is written.
+        seed: split seed.
+        check_duplicates: run the perceptual audit and merge what it finds.
+            Turning this off restores per-filename grouping alone, which is
+            leak-prone; it exists for datasets large enough that hashing costs
+            real time.
+        duplicate_threshold: passed to `group_duplicates`.
+        on_duplicates: called with the audit report when the check runs, so a
+            caller can print it. The report describes the split that filename
+            grouping alone would have produced.
+
+    Returns:
+        The data.yaml and the stats.
+    """
     records = ingest_sources(raw_dir)
+
+    if check_duplicates:
+        records, report = group_duplicates(
+            records, raw_dir, seed=seed, threshold=duplicate_threshold
+        )
+        if on_duplicates is not None:
+            on_duplicates(report)
+
     write_manifest(records, manifest_path)
 
     records = read_manifest(manifest_path)
@@ -204,6 +287,9 @@ def ensure_dataset(
     api_key: str | None = None,
     seed: int = 0,
     force: bool = False,
+    check_duplicates: bool = True,
+    duplicate_threshold: int = DEFAULT_THRESHOLD,
+    on_duplicates: Callable[[DuplicateReport], None] | None = None,
 ) -> Path:
     """Return a usable `data.yaml`, building the dataset if it is missing.
 
@@ -214,6 +300,9 @@ def ensure_dataset(
         api_key: Roboflow key. Read from the environment or Colab secrets when
             omitted — and only needed if a download is actually required.
         force: rebuild even if an export already exists.
+        check_duplicates: forwarded to `build_dataset`.
+        duplicate_threshold: forwarded to `build_dataset`.
+        on_duplicates: forwarded to `build_dataset`.
     """
     data_yaml = Path(out_dir) / "data.yaml"
 
@@ -227,5 +316,13 @@ def ensure_dataset(
             api_key = get_credential(ROBOFLOW_KEY_VAR)
         download_sources(raw_dir, api_key)
 
-    data_yaml, _ = build_dataset(raw_dir, out_dir, manifest_path, seed=seed)
+    data_yaml, _ = build_dataset(
+        raw_dir,
+        out_dir,
+        manifest_path,
+        seed=seed,
+        check_duplicates=check_duplicates,
+        duplicate_threshold=duplicate_threshold,
+        on_duplicates=on_duplicates,
+    )
     return data_yaml

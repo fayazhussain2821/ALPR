@@ -4,7 +4,117 @@ from __future__ import annotations
 
 import pytest
 
-from alpr.data import DatasetError, ImageRecord, PlateBox, Region
+from alpr.data import DatasetError, ImageRecord, PlateBox, Region, clip_id, strip_export_suffix
+
+
+class TestStripExportSuffix:
+    """Roboflow renames every export to `<original>_<ext>.rf.<32-hex>`.
+
+    All 188 surviving real identifiers carry it, in three extension flavours.
+    The frame patterns anchor at the end of the string, so leaving it attached
+    is what made the frame rule match nothing on the real dataset.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            # The three extensions the real ids actually use: jpg (173),
+            # jpeg (13), png (2).
+            (
+                "dayride_type1_001-mp4-t-751_jpg.rf.5c6687a87b9a7a5a3cff5183d1ab1730",
+                "dayride_type1_001-mp4-t-751",
+            ),
+            (
+                "car-wbs-KL54H369_00000_jpeg.rf.ec38c1bf7ae1c0a7d5a550a0c2e59a47",
+                "car-wbs-KL54H369_00000",
+            ),
+            (
+                "video3_2190_png.rf.f9a4bf94d32d92ec52483139a3029050",
+                "video3_2190",
+            ),
+        ],
+    )
+    def test_strips_the_real_suffix(self, name, expected):
+        assert strip_export_suffix(name) == expected
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "plain_photo",
+            "photo.rf.deadbeef",  # too short to be an md5
+            "photo_jpg.rf.notallhexdigitsxxxxxxxxxxxxxxxxx",  # not hex
+            "photo_txt.rf.5c6687a87b9a7a5a3cff5183d1ab1730",  # not an image ext
+            "photo_jpg.rf.5c6687a87b9a7a5a3cff5183d1ab1730x",  # 33 chars
+            "prefix_jpg.rf.5c6687a87b9a7a5a3cff5183d1ab1730_suffix",  # not at end
+        ],
+    )
+    def test_leaves_everything_else_alone(self, name):
+        assert strip_export_suffix(name) == name
+
+
+class TestClipId:
+    @pytest.mark.parametrize(
+        ("name", "clip"),
+        [
+            # --- Roboflow video export, real ids ---
+            (
+                "dayride_type1_001-mp4-t-451_jpg.rf.570aecd2ac67cc8efe361d014d8b4a0f",
+                "dayride_type1_001",
+            ),
+            (
+                "dayride_type1_001-mp4-t-1115_jpg.rf.0e19cdbaf4ebcd9807f9821253e88a63",
+                "dayride_type1_001",
+            ),
+            (
+                "nightride_type3_001-mp4-t-256_jpg.rf.5590acf9db420e97fd1d4fa81ccb14f8",
+                "nightride_type3_001",
+            ),
+            # ... and unsuffixed, which is what the rule used to assume
+            ("dayride_type1_001-mp4-t-1062", "dayride_type1_001"),
+            ("clip_avi_t_9", "clip"),
+            # --- video<N>_<M>, real ids ---
+            ("video3_2190_jpg.rf.f9a4bf94d32d92ec52483139a3029050", "video3"),
+            ("video11_1870_jpg.rf.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "video11"),
+            ("video8_870", "video8"),
+            # --- classic frame naming ---
+            ("clip_042_frame_0137", "clip_042"),
+            ("clip-7-frame-9", "clip-7"),
+        ],
+    )
+    def test_recognised_frames(self, name, clip):
+        assert clip_id(name) == clip
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Ordinary stills — the population a loose rule would wreck.
+            "d_license_plate_188_jpg.rf.487f425dd3a99b3d42ac72be15690f65",
+            "pl_license_plate_327_jpg.rf.dcd2b7a1c3c0296310c252682e78e48f",
+            "car-wbs-KL54H369_00000_jpeg.rf.ec38c1bf7ae1c0a7d5a550a0c2e59a47",
+            "license_plate_205",
+            "license_plate_242",
+            # video<N>_<M> near-misses, each documented in _CLIP_PATTERNS
+            "video_2190",  # no clip number after `video`
+            "myvideo3_2190",  # `video` must start a word
+            "video3",  # no frame number
+            "video3_2190_640",  # frame number must end the string
+            "videos_12",  # `video` not followed by a digit
+            # malformed / degenerate
+            "",
+            "frame_12",  # nothing before the marker to name a clip
+            "-mp4-t-5",  # ditto
+            "___",
+        ],
+    )
+    def test_not_a_frame(self, name):
+        assert clip_id(name) is None
+
+    def test_the_two_real_205_242_stills_stay_apart(self):
+        # schema.py refuses a bare trailing-number rule precisely because it
+        # would collapse these into one group and hand most of the dataset to a
+        # single split.
+        assert clip_id("pl_license_plate_205") is None
+        assert clip_id("pl_license_plate_242") is None
 
 
 class TestPlateBox:

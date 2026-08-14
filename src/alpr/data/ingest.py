@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from alpr.data.schema import DatasetError, ImageRecord, PlateBox, Region
+from alpr.data.schema import DatasetError, ImageRecord, PlateBox, Region, clip_id
 
 _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -211,6 +211,27 @@ def from_yolo_dir(
 _ROBOFLOW_SPLIT_DIRS = ("train", "valid", "val", "test")
 
 
+def _group_for(
+    image_id: str,
+    split_prefix: str,
+    id_prefix: str | None,
+    group_by_clip: bool,
+) -> str:
+    """The split group for one exported record.
+
+    A recognised video frame gets `<source prefix><clip>` — no upstream
+    directory, so every frame of that clip lands in one group whichever
+    directory Roboflow exported it into. Anything else keeps a per-image group,
+    which is the conservative choice: see `from_roboflow_export`.
+    """
+    if not group_by_clip:
+        return image_id
+
+    stem = image_id[len(split_prefix) :] if image_id.startswith(split_prefix) else image_id
+    clip = clip_id(stem)
+    return f"{id_prefix or ''}{clip}" if clip else image_id
+
+
 def from_roboflow_export(
     location: str | Path,
     *,
@@ -219,6 +240,7 @@ def from_roboflow_export(
     keep_classes: frozenset[int] | None = None,
     id_prefix: str | None = None,
     path_root: str | Path | None = None,
+    group_by_clip: bool = True,
     strict: bool = False,
 ) -> IngestReport:
     """Ingest a Roboflow YOLO export, pooling all of its splits.
@@ -240,11 +262,42 @@ def from_roboflow_export(
         id_prefix: prefix for image ids, to keep sources from colliding.
         path_root: root the stored paths are relative to. Defaults to
             `location`'s parent so several exports compose under one root.
+        group_by_clip: give frames of one video a shared split group derived
+            from the filename, **independently of which upstream directory they
+            were exported into**. See the section below; leave it on unless you
+            are deliberately reproducing the old, leak-prone grouping.
         strict: raise on a malformed label rather than recording it.
 
     Raises:
         DatasetError: when the export contains none of the expected split
             directories.
+
+    ### Why the group cannot simply be the image id
+
+    `image_id` has to carry the upstream directory — stems are not unique across
+    `train/`, `valid/` and `test/`, and a collision would abort `write_manifest`
+    only after the whole multi-gigabyte download. But that makes the id useless
+    as a *clip* identity: Roboflow scatters frames of one video across its own
+    directories, so `dayride_type1_001` arrives as both `eu-train-…` and
+    `eu-test-…`, and grouping on the id splits the clip in two.
+
+    Measured on the 188 surviving real identifiers: 9 of 12 clip groups span
+    more than one upstream directory, `dayride_type1_001` spanning all three.
+
+    So the group is built from the *stem* — source prefix plus clip identity,
+    with the directory dropped. Two frames of one clip therefore land in one
+    group no matter where they were exported.
+
+    ### Why only frames get this treatment
+
+    Dropping the directory is safe exactly when the stem identifies something
+    real. For a recognised frame it does. For an ordinary still it would mean
+    trusting that two files named `001.jpg` in `train/` and `test/` are the same
+    photograph — which nothing here establishes. Stills therefore keep a
+    per-image group, and the false-merge surface stays limited to filenames that
+    explicitly announce themselves as video frames. Perceptual hashing in
+    `alpr.dupes` is what relates stills, and it looks at pixels rather than
+    names.
     """
     location = Path(location)
     if not location.is_dir():
@@ -282,7 +335,11 @@ def from_roboflow_export(
             strict=strict,
         )
         records.extend(
-            replace(record, meta={**record.meta, "roboflow_split": split_dir})
+            replace(
+                record,
+                meta={**record.meta, "roboflow_split": split_dir},
+                group=_group_for(record.image_id, split_prefix, id_prefix, group_by_clip),
+            )
             for record in report.records
         )
         no_label.extend(report.skipped_no_label)

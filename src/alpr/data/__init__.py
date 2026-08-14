@@ -14,6 +14,8 @@ from alpr.data.schema import (
     PlateBox,
     Region,
     Split,
+    clip_id,
+    strip_export_suffix,
 )
 from alpr.data.split import (
     DEFAULT_RATIOS,
@@ -36,6 +38,7 @@ __all__ = [
     "Split",
     "SplitAssignment",
     "check_exit_criteria",
+    "clip_id",
     "compute_stats",
     "export_yolo",
     "format_label_file",
@@ -45,6 +48,7 @@ __all__ = [
     "iter_manifest",
     "read_manifest",
     "split_records",
+    "strip_export_suffix",
     "verify_split",
     "write_manifest",
 ]

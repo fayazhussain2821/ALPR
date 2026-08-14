@@ -6,6 +6,8 @@ notebook can run in a fresh session, not Roboflow's client.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 from PIL import Image
 
@@ -16,9 +18,12 @@ from alpr.build import (
     build_dataset,
     dataset_ready,
     ensure_dataset,
+    group_duplicates,
     ingest_sources,
 )
+from alpr.data import read_manifest, split_records
 from alpr.data.schema import Region
+from alpr.dupes import DUPLICATE_GROUP_PREFIX
 
 
 class TestSources:
@@ -70,20 +75,65 @@ class TestSources:
             assert source.url in text
 
 
+def _distinct_image(path, key: int) -> None:
+    """Write an image whose perceptual hash is unlike every other key's.
+
+    These used to be `Image.new("RGB", (640, 480))` — the same black rectangle
+    every time, so the whole fixture was 48 copies of one picture. That was
+    invisible while nothing hashed the dataset. Now that `build_dataset`
+    audits for near-duplicates it is not: 48 identical images correctly collapse
+    into a single split group, one split takes everything, and `verify_split`
+    rejects the build. The fixture was wrong, not the audit.
+
+    A high-contrast 9x8 pattern upscaled by an exact integer factor survives
+    dhash's own 9x8 thumbnailing, so distinct keys land ~32 bits apart against a
+    threshold of 5 — comfortably distinct, and identical keys hash identically,
+    which is what `_twin` relies on.
+    """
+    rng = random.Random(key)
+    small = Image.new("L", (9, 8))
+    small.putdata([rng.choice((0, 255)) for _ in range(72)])
+    small.convert("RGB").resize((648, 480), Image.Resampling.NEAREST).save(path)
+
+
 def _fake_download(raw_dir, n=4):
     """Mimic what Roboflow writes: one directory per source, per split."""
     raw_dir.mkdir(parents=True, exist_ok=True)
-    for source in SOURCES:
-        for split in ("train", "valid", "test"):
+    for index, source in enumerate(SOURCES):
+        for split_index, split in enumerate(("train", "valid", "test")):
             images = raw_dir / source.directory / split / "images"
             labels = raw_dir / source.directory / split / "labels"
             images.mkdir(parents=True)
             labels.mkdir(parents=True)
             for i in range(n):
                 stem = f"{split}_{i}"
-                Image.new("RGB", (640, 480)).save(images / f"{stem}.jpg")
+                # Unique per (source, upstream split, index) so no two images in
+                # the fixture are accidentally the same picture.
+                _distinct_image(images / f"{stem}.jpg", 1000 * index + 100 * split_index + i)
                 (labels / f"{stem}.txt").write_text("0 0.5 0.6 0.2 0.08\n")
     return raw_dir
+
+
+def _twin(raw_dir, source, split, stem, of_key):
+    """Add an image to an upstream split that is a copy of `of_key`'s picture."""
+    images = raw_dir / source.directory / split / "images"
+    labels = raw_dir / source.directory / split / "labels"
+    _distinct_image(images / f"{stem}.jpg", of_key)
+    (labels / f"{stem}.txt").write_text("0 0.5 0.6 0.2 0.08\n")
+
+
+def _split_of_exported(out_dir):
+    """Map image_id -> split by reading the exported tree, not by recomputing.
+
+    The tree is the artifact training consumes, so asserting against it proves
+    the split that was actually written rather than the split the same code
+    would compute a second time.
+    """
+    placement = {}
+    for split in ("train", "val", "test"):
+        for label in (out_dir / "labels" / split).glob("*.txt"):
+            placement[label.stem] = split
+    return placement
 
 
 class TestIngest:
@@ -116,6 +166,263 @@ class TestBuildDataset:
         _, first = build_dataset(raw, tmp_path / "a", tmp_path / "m1.jsonl", seed=0)
         _, second = build_dataset(raw, tmp_path / "b", tmp_path / "m2.jsonl", seed=0)
         assert first.by_split == second.by_split
+
+
+class TestDuplicateRegrouping:
+    """The audit is part of the build, not a tool nobody runs.
+
+    Every test here builds a real dataset containing known near-duplicates and
+    asserts against the *exported tree*, which is what training consumes.
+    """
+
+    def _build_with_twins(self, tmp_path, *, n=8, **kwargs):
+        raw = _fake_download(tmp_path / "raw", n=n)
+        source = SOURCES[0]
+        # The leak this exists to stop: the same picture in the upstream train
+        # and test directories, under names nothing relates to each other.
+        _twin(raw, source, "train", "twin_left", of_key=777)
+        _twin(raw, source, "test", "twin_right", of_key=777)
+        out = tmp_path / "yolo"
+        build_dataset(raw, out, tmp_path / "manifest.jsonl", **kwargs)
+        return raw, out
+
+    def test_near_duplicates_cannot_cross_splits(self, tmp_path):
+        _, out = self._build_with_twins(tmp_path)
+        placement = _split_of_exported(out)
+        left = placement[f"{SOURCES[0].id_prefix}train-twin_left"]
+        right = placement[f"{SOURCES[0].id_prefix}test-twin_right"]
+        assert left == right, "a memorized image reached a held-out split"
+
+    def test_without_the_check_they_do_cross(self, tmp_path):
+        # Proves the test above is actually testing something: the same fixture
+        # with the audit disabled puts the twins on opposite sides.
+        _, out = self._build_with_twins(tmp_path, check_duplicates=False)
+        placement = _split_of_exported(out)
+        left = placement[f"{SOURCES[0].id_prefix}train-twin_left"]
+        right = placement[f"{SOURCES[0].id_prefix}test-twin_right"]
+        assert left != right
+
+    def test_a_whole_duplicate_group_stays_intact(self, tmp_path):
+        raw = _fake_download(tmp_path / "raw", n=8)
+        source = SOURCES[0]
+        # Five copies of one picture, spread across all three upstream splits.
+        for split, stem in (
+            ("train", "c1"),
+            ("train", "c2"),
+            ("valid", "c3"),
+            ("test", "c4"),
+            ("test", "c5"),
+        ):
+            _twin(raw, source, split, stem, of_key=555)
+        out = tmp_path / "yolo"
+        build_dataset(raw, out, tmp_path / "manifest.jsonl")
+
+        placement = _split_of_exported(out)
+        cluster = {
+            placement[f"{source.id_prefix}{split}-{stem}"]
+            for split, stem in (
+                ("train", "c1"),
+                ("train", "c2"),
+                ("valid", "c3"),
+                ("test", "c4"),
+                ("test", "c5"),
+            )
+        }
+        assert len(cluster) == 1, f"cluster of 5 was split across {cluster}"
+
+    def test_the_merged_group_is_persisted_in_the_manifest(self, tmp_path):
+        # Manifest-as-source-of-truth: the groups the split was computed from
+        # have to be *in* the manifest, or a downstream read_manifest() +
+        # split_records() disagrees with the tree that was exported.
+        raw = _fake_download(tmp_path / "raw", n=8)
+        source = SOURCES[0]
+        _twin(raw, source, "train", "twin_left", of_key=777)
+        _twin(raw, source, "test", "twin_right", of_key=777)
+        manifest = tmp_path / "manifest.jsonl"
+        build_dataset(raw, tmp_path / "yolo", manifest)
+
+        groups = {r.image_id: r.group for r in read_manifest(manifest)}
+        left = groups[f"{source.id_prefix}train-twin_left"]
+        right = groups[f"{source.id_prefix}test-twin_right"]
+        assert left == right
+        assert left.startswith(DUPLICATE_GROUP_PREFIX)
+
+    def test_the_exported_tree_matches_the_manifest(self, tmp_path):
+        # The invariant notebooks 03+ rely on: read the manifest, re-split with
+        # the same seed, and you get the split that was exported.
+        raw, out = self._build_with_twins(tmp_path)
+        manifest = tmp_path / "manifest.jsonl"
+
+        records = read_manifest(manifest)
+        assignment = split_records(records, seed=0)
+        recomputed = {r.image_id: assignment.of(r).value for r in records}
+        assert recomputed == _split_of_exported(out)
+
+    def test_ordinary_images_keep_their_own_group(self, tmp_path):
+        # A still with no twin must still split per image, not get swept into
+        # some merged group.
+        raw, _ = self._build_with_twins(tmp_path)
+        records = read_manifest(tmp_path / "manifest.jsonl")
+        untwinned = [r for r in records if "twin" not in r.image_id]
+        twinned = [r for r in records if "twin" in r.image_id]
+
+        assert len(twinned) == 2, "fixture should have produced exactly one twin pair"
+        assert len(untwinned) == len(SOURCES) * 3 * 8
+        # An ordinary still is its own group: nothing in the filename says two
+        # stills are related, so ingest will not claim they are.
+        assert all(r.group == r.image_id for r in untwinned)
+        assert all(r.group.startswith(DUPLICATE_GROUP_PREFIX) for r in twinned)
+
+    def test_builds_stay_deterministic(self, tmp_path):
+        raw = _fake_download(tmp_path / "raw", n=8)
+        source = SOURCES[0]
+        _twin(raw, source, "train", "twin_left", of_key=777)
+        _twin(raw, source, "test", "twin_right", of_key=777)
+
+        first_manifest = tmp_path / "m1.jsonl"
+        second_manifest = tmp_path / "m2.jsonl"
+        build_dataset(raw, tmp_path / "a", first_manifest, seed=0)
+        build_dataset(raw, tmp_path / "b", second_manifest, seed=0)
+
+        # Byte-identical manifests: same groups, same order, same everything.
+        assert first_manifest.read_bytes() == second_manifest.read_bytes()
+        assert _split_of_exported(tmp_path / "a") == _split_of_exported(tmp_path / "b")
+
+    def test_region_stratification_survives(self, tmp_path):
+        # Each region must still be spread over the splits; regrouping must not
+        # let one region collapse into a single split.
+        raw, out = self._build_with_twins(tmp_path, n=16)
+        records = read_manifest(tmp_path / "manifest.jsonl")
+        placement = _split_of_exported(out)
+
+        by_region: dict[Region, set[str]] = {}
+        for record in records:
+            by_region.setdefault(record.primary_region, set()).add(placement[record.image_id])
+
+        assert set(by_region) == {s.region for s in SOURCES}
+        for region, splits in by_region.items():
+            assert splits == {"train", "val", "test"}, f"{region} only reached {splits}"
+
+    def test_verify_split_still_runs_on_every_build(self, tmp_path, monkeypatch):
+        # Adding a step before the split must not have moved the guard that
+        # rejects an unsound one.
+        seen = []
+
+        def spy(records, assignment, **kwargs):
+            seen.append((len(list(records)), assignment))
+
+        monkeypatch.setattr("alpr.build.verify_split", spy)
+        raw = _fake_download(tmp_path / "raw", n=8)
+        build_dataset(raw, tmp_path / "yolo", tmp_path / "m.jsonl")
+
+        assert len(seen) == 1, f"verify_split ran {len(seen)} time(s)"
+        count, assignment = seen[0]
+        # It must see the post-regrouping records, not the ingested ones.
+        assert count == len(SOURCES) * 3 * 8
+        assert assignment is not None
+
+    def test_an_unsound_split_still_aborts_the_build(self, tmp_path):
+        # The whole fixture is one picture, so every image collapses into one
+        # group and two splits get nothing. That must fail loudly rather than
+        # export a dataset with an empty test split.
+        from alpr.data.schema import DatasetError
+
+        raw = tmp_path / "raw"
+        for source in SOURCES:
+            for split in ("train", "valid", "test"):
+                (raw / source.directory / split / "images").mkdir(parents=True)
+                (raw / source.directory / split / "labels").mkdir(parents=True)
+                for i in range(4):
+                    _twin(raw, source, split, f"{split}_{i}", of_key=1)
+
+        with pytest.raises(DatasetError, match="received no images"):
+            build_dataset(raw, tmp_path / "yolo", tmp_path / "m.jsonl")
+
+    def test_the_report_is_handed_to_the_caller(self, tmp_path):
+        seen = []
+        raw = _fake_download(tmp_path / "raw", n=8)
+        source = SOURCES[0]
+        _twin(raw, source, "train", "twin_left", of_key=777)
+        _twin(raw, source, "test", "twin_right", of_key=777)
+        build_dataset(
+            raw,
+            tmp_path / "yolo",
+            tmp_path / "m.jsonl",
+            on_duplicates=seen.append,
+        )
+        assert len(seen) == 1
+        # The report describes the pre-regrouping split, so the contamination
+        # it names is what the build went on to prevent.
+        assert seen[0].contaminating
+        assert "measure memorization" in seen[0].report()
+
+    def test_a_clip_straddling_upstream_splits_ends_in_one_split(self, tmp_path):
+        """The exact leak the README describes, end to end.
+
+        Roboflow put consecutive frames of one clip in its own train and test
+        directories. Filename grouping alone cannot rejoin them, because the
+        image id carries the upstream split (`eu-train-…` vs `eu-test-…`) to
+        stop stems colliding. Hashing relates the frames that look alike, and
+        the closure over both relations then pulls in the rest of each clip.
+        """
+        raw = _fake_download(tmp_path / "raw", n=8)
+        source = SOURCES[0]
+        # Four frames of one clip: two in the upstream train dir, two in test.
+        # Frames 1 and 3 look alike (one moment), 2 and 4 do not.
+        for split, frame, key in (
+            ("train", 1062, 900),
+            ("train", 1063, 901),
+            ("test", 1064, 900),
+            ("test", 1065, 902),
+        ):
+            _twin(raw, source, split, f"dayride_type1_001-mp4-t-{frame}", of_key=key)
+
+        out = tmp_path / "yolo"
+        build_dataset(raw, out, tmp_path / "manifest.jsonl")
+        placement = _split_of_exported(out)
+
+        landed = {
+            placement[f"{source.id_prefix}{split}-dayride_type1_001-mp4-t-{frame}"]
+            for split, frame in (
+                ("train", 1062),
+                ("train", 1063),
+                ("test", 1064),
+                ("test", 1065),
+            )
+        }
+        assert len(landed) == 1, f"one clip was split across {landed}"
+
+    def test_threshold_zero_still_catches_exact_copies(self, tmp_path):
+        _, out = self._build_with_twins(tmp_path, duplicate_threshold=0)
+        placement = _split_of_exported(out)
+        assert (
+            placement[f"{SOURCES[0].id_prefix}train-twin_left"]
+            == placement[f"{SOURCES[0].id_prefix}test-twin_right"]
+        )
+
+
+class TestGroupDuplicates:
+    """The seam `build_dataset` uses, in isolation."""
+
+    def test_grouping_ignores_the_provisional_seed(self, tmp_path):
+        # The provisional assignment exists only so a pair can name the splits
+        # it crosses. If the seed leaked into the grouping, a rebuild with a
+        # different seed would merge different images.
+        raw = _fake_download(tmp_path / "raw", n=8)
+        _twin(raw, SOURCES[0], "train", "twin_left", of_key=777)
+        _twin(raw, SOURCES[0], "test", "twin_right", of_key=777)
+        records = ingest_sources(raw)
+
+        zero, _ = group_duplicates(records, raw, seed=0)
+        seven, _ = group_duplicates(records, raw, seed=7)
+        assert [r.group for r in zero] == [r.group for r in seven]
+
+    def test_a_clean_dataset_is_returned_unchanged(self, tmp_path):
+        raw = _fake_download(tmp_path / "raw", n=8)
+        records = ingest_sources(raw)
+        regrouped, report = group_duplicates(records, raw)
+        assert regrouped == records
+        assert report.pairs == []
 
 
 class TestDatasetReady:

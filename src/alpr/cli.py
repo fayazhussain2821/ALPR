@@ -11,6 +11,10 @@ import sys
 from collections.abc import Sequence
 
 from alpr import __version__
+
+# Cheap: alpr.dupes imports nothing heavier than stdlib at module scope (PIL is
+# imported inside dhash), so `alpr env` still pays nothing for this.
+from alpr.dupes import DEFAULT_THRESHOLD
 from alpr.env import detect_gpus, in_colab
 
 
@@ -129,6 +133,14 @@ def _cmd_fetch_data(args: argparse.Namespace) -> int:
     from alpr.build import BuildError, ensure_dataset
     from alpr.env import MissingCredential
 
+    def show_duplicates(report) -> None:
+        # The audit describes the split filename grouping alone would have
+        # produced; the build has already merged what it found, so this is the
+        # leakage that was prevented rather than leakage that remains.
+        print("--- duplicate audit (before regrouping) ---")
+        print(report.report())
+        print("-------------------------------------------\n")
+
     try:
         data_yaml = ensure_dataset(
             raw_dir=args.raw_dir,
@@ -136,6 +148,9 @@ def _cmd_fetch_data(args: argparse.Namespace) -> int:
             manifest_path=args.manifest,
             seed=args.seed,
             force=args.force,
+            check_duplicates=not args.no_duplicate_check,
+            duplicate_threshold=args.duplicate_threshold,
+            on_duplicates=show_duplicates,
         )
     except MissingCredential as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -250,6 +265,26 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_cmd.add_argument("--manifest", default="data/manifest.jsonl")
     fetch_cmd.add_argument("--seed", type=int, default=0)
     fetch_cmd.add_argument("--force", action="store_true", help="rebuild even if the export exists")
+    fetch_cmd.add_argument(
+        "--no-duplicate-check",
+        action="store_true",
+        dest="no_duplicate_check",
+        help=(
+            "skip the perceptual near-duplicate audit. Faster on a very large "
+            "dataset, and leak-prone: augmented copies of one photograph then "
+            "split freely between train and test"
+        ),
+    )
+    fetch_cmd.add_argument(
+        "--duplicate-threshold",
+        type=int,
+        default=DEFAULT_THRESHOLD,
+        dest="duplicate_threshold",
+        help=(
+            f"Hamming distance (of 64) below which two images are the same "
+            f"picture (default {DEFAULT_THRESHOLD}; 0 = exact matches only)"
+        ),
+    )
     fetch_cmd.set_defaults(func=_cmd_fetch_data)
 
     return parser

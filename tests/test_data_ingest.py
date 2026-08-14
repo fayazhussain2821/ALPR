@@ -206,6 +206,46 @@ def _make_roboflow_export(tmp_path, name="export", splits=("train", "valid", "te
     return location
 
 
+# Verbatim filenames from the project's own surviving identifiers
+# (`labels/index.json`), minus the `<source>-<dir>-` prefix that ingest adds
+# back. Synthetic stand-ins would not have caught the bug these guard: the
+# `_jpg.rf.<32-hex>` suffix is exactly what stopped the frame rule matching.
+REAL_DAYRIDE = [
+    "dayride_type1_001-mp4-t-451_jpg.rf.570aecd2ac67cc8efe361d014d8b4a0f",
+    "dayride_type1_001-mp4-t-491_jpg.rf.bca97daf1eb0a40df5a3ef85d6f03599",
+    "dayride_type1_001-mp4-t-751_jpg.rf.5c6687a87b9a7a5a3cff5183d1ab1730",
+    "dayride_type1_001-mp4-t-1115_jpg.rf.0e19cdbaf4ebcd9807f9821253e88a63",
+]
+REAL_NIGHTRIDE = [
+    "nightride_type3_001-mp4-t-256_jpg.rf.5590acf9db420e97fd1d4fa81ccb14f8",
+    "nightride_type3_001-mp4-t-540_jpg.rf.074a05f85482dd46241f83b1e3b07259",
+]
+REAL_VIDEO3 = [
+    "video3_640_jpg.rf.94139d382e35981bc62633d868c43c87",
+    "video3_1220_jpg.rf.6425a54377facd894a0311dc4daf412b",
+    "video3_2190_jpg.rf.f9a4bf94d32d92ec52483139a3029050",
+]
+REAL_STILLS = [
+    "d_license_plate_188_jpg.rf.487f425dd3a99b3d42ac72be15690f65",
+    "pl_license_plate_327_jpg.rf.dcd2b7a1c3c0296310c252682e78e48f",
+    "car-wbs-KL54H369_00000_jpeg.rf.ec38c1bf7ae1c0a7d5a550a0c2e59a47",
+]
+
+
+def _export_with(tmp_path, by_split, name="export"):
+    """Build a Roboflow-shaped export from explicit `{split: [stem, ...]}`."""
+    location = tmp_path / name
+    for split, stems in by_split.items():
+        images = location / split / "images"
+        labels = location / split / "labels"
+        images.mkdir(parents=True, exist_ok=True)
+        labels.mkdir(parents=True, exist_ok=True)
+        for stem in stems:
+            Image.new("RGB", (640, 480)).save(images / f"{stem}.jpg")
+            (labels / f"{stem}.txt").write_text("0 0.5 0.5 0.2 0.1\n")
+    return location
+
+
 class TestFromRoboflowExport:
     def test_pools_every_split(self, tmp_path):
         # Roboflow's own split is discarded — we re-split ourselves, grouped
@@ -221,6 +261,56 @@ class TestFromRoboflowExport:
     def test_tolerates_a_missing_split(self, tmp_path):
         location = _make_roboflow_export(tmp_path, splits=("train",))
         assert len(from_roboflow_export(location, source="rf").records) == 3
+
+    def test_video_frames_in_one_directory_share_a_group(self, tmp_path):
+        location = _export_with(tmp_path, {"train": REAL_DAYRIDE[:2]})
+        records = from_roboflow_export(location, source="rf").records
+        assert len({r.group_key for r in records}) == 1
+
+    def test_video_frames_across_directories_share_a_group(self, tmp_path):
+        # The leak this whole change exists to close: Roboflow scatters frames
+        # of one clip across its own train/valid/test directories, and the
+        # image id has to carry the directory to keep stems unique. Grouping on
+        # the id therefore split the clip in two.
+        location = _export_with(
+            tmp_path,
+            {"train": REAL_DAYRIDE[:2], "valid": REAL_DAYRIDE[2:3], "test": REAL_DAYRIDE[3:4]},
+        )
+        records = from_roboflow_export(location, source="rf", id_prefix="eu-").records
+        assert len(records) == 4
+        assert len({r.group_key for r in records}) == 1
+        assert records[0].group_key == "eu-dayride_type1_001"
+        # The upstream directory survives for provenance, just not in the group.
+        assert {r.meta["roboflow_split"] for r in records} == {"train", "valid", "test"}
+
+    def test_video_n_frames_across_directories_share_a_group(self, tmp_path):
+        location = _export_with(tmp_path, {"train": REAL_VIDEO3[:1], "test": REAL_VIDEO3[1:]})
+        records = from_roboflow_export(location, source="rf", id_prefix="in-").records
+        assert len({r.group_key for r in records}) == 1
+        assert records[0].group_key == "in-video3"
+
+    def test_two_clips_do_not_merge(self, tmp_path):
+        location = _export_with(
+            tmp_path, {"train": REAL_DAYRIDE[:2] + REAL_NIGHTRIDE[:2] + REAL_VIDEO3[:1]}
+        )
+        records = from_roboflow_export(location, source="rf").records
+        assert len({r.group_key for r in records}) == 3
+
+    def test_unrelated_stills_still_get_their_own_group(self, tmp_path):
+        # Stills carry no evidence that two of them are related, so ingest does
+        # not claim they are. Only filenames that announce themselves as video
+        # frames get a shared group.
+        location = _export_with(tmp_path, {"train": REAL_STILLS, "test": REAL_STILLS[:1]})
+        records = from_roboflow_export(location, source="rf").records
+        assert len({r.group_key for r in records}) == len(records)
+        assert all(r.group == r.image_id for r in records)
+
+    def test_grouping_can_be_pinned_to_the_image_id(self, tmp_path):
+        # The escape hatch that reproduces the old, leak-prone grouping.
+        location = _export_with(tmp_path, {"train": REAL_DAYRIDE[:1], "test": REAL_DAYRIDE[1:2]})
+        records = from_roboflow_export(location, source="rf", group_by_clip=False).records
+        assert all(r.group == r.image_id for r in records)
+        assert len({r.group_key for r in records}) == 2
 
     def test_paths_resolve_under_the_shared_root(self, tmp_path):
         location = _make_roboflow_export(tmp_path)

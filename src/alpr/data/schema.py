@@ -137,23 +137,78 @@ class PlateBox:
         )
 
 
-# A frame filename like "clip_042_frame_0137.jpg" belongs to clip_042. Frames
-# from one clip are near-duplicates, so they must not straddle a split.
-# Frame filenames come in more than one shape. `clip_042_frame_0137` is the
-# obvious one; Roboflow exports video frames as `dayride_type1_001-mp4-t-1062`,
-# which the `frame` pattern alone does not match — and that miss put frames
-# 1062 and 1063 of one clip on opposite sides of a train/test split.
+# --- Clip identity -----------------------------------------------------------
 #
-# Both alternatives require an explicit marker (`frame`, or a video extension
-# followed by a timecode). A bare trailing-number rule would be far more
-# dangerous than useful: it would collapse `license_plate_205` and
-# `license_plate_242` into one group and hand most of the dataset to a single
-# split. Perceptual duplicate grouping in `alpr.dupes` is the general safety
-# net; this only catches what a filename can prove.
-_FRAME_SUFFIX = re.compile(
-    r"[_-](?:mp4|avi|mov|mkv|webm)[_-]t[_-]\d+$|[_-]?frame[_-]?\d+$",
+# Frames sampled from one video are near-duplicates, so they must never straddle
+# a split. Recognising them is entirely a filename question, and the filenames
+# arrive in more than one shape.
+#
+# **The export suffix has to come off first.** Roboflow renames every exported
+# file to `<original>_<ext>.rf.<32-hex-md5>`. Every one of the 188 surviving
+# real identifiers in this project carries it. The frame patterns below are
+# anchored at the end of the string, so with that suffix still attached they
+# match nothing at all — which is exactly why the frame rule never once fired on
+# the real dataset, and why frames 1062 and 1063 of one clip sat on opposite
+# sides of a train/test split while the rule that was supposed to stop it looked
+# correct in its own unit tests.
+_EXPORT_SUFFIX = re.compile(
+    r"_(?:jpe?g|png|bmp|webp|tiff?)\.rf\.[0-9a-f]{32}$",
     re.IGNORECASE,
 )
+
+
+def strip_export_suffix(name: str) -> str:
+    """Remove a Roboflow export suffix (`_jpg.rf.<32-hex>`), if present.
+
+    Matched strictly — a specific image extension, the literal `.rf.`, and
+    exactly 32 hex characters — so it cannot bite a filename that merely
+    contains a dot or a long token.
+    """
+    return _EXPORT_SUFFIX.sub("", name)
+
+
+# Every pattern must anchor on an explicit marker and capture the clip identity
+# in a `clip` group. A bare trailing-number rule is deliberately absent: it would
+# collapse `license_plate_205` and `license_plate_242` into one group and hand
+# most of the dataset to a single split. Perceptual grouping in `alpr.dupes` is
+# the general safety net; these only catch what a filename can prove.
+_CLIP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Roboflow's video export: `dayride_type1_001-mp4-t-1062`. A video container
+    # extension followed by a `t` timecode.
+    re.compile(
+        r"^(?P<clip>.+?)[-_](?:mp4|avi|mov|mkv|webm)[-_]t[-_]\d+$",
+        re.IGNORECASE,
+    ),
+    # The Indian source's convention: `video3_2190`, `video11_1870` — the
+    # literal word `video`, its clip number, then an underscore and the frame
+    # number. Scoped tightly on purpose:
+    #   matches     video3_2190, video11_1870, in-train-video8_870
+    #   no match    license_plate_242  (no `video`)
+    #   no match    video_2190         (no clip number after `video`)
+    #   no match    myvideo3_2190      (`\b` — `video` must start a word)
+    #   no match    video3             (no frame number)
+    #   no match    video3_2190_640    (frame number must end the string)
+    re.compile(r"^(?P<clip>.*\bvideo\d+)_\d+$", re.IGNORECASE),
+    # The classic convention: `clip_042_frame_0137`.
+    re.compile(r"^(?P<clip>.+?)[-_]?frame[-_]?\d+$", re.IGNORECASE),
+)
+
+
+def clip_id(name: str) -> str | None:
+    """The clip a frame filename belongs to, or None if it is not a frame.
+
+    The export suffix is stripped first, so this works on raw exported names.
+    Returns None for an ordinary still, which is what keeps unrelated
+    photographs in separate split groups.
+    """
+    base = strip_export_suffix(name)
+    for pattern in _CLIP_PATTERNS:
+        found = pattern.match(base)
+        if found:
+            clip = found.group("clip")
+            if clip:
+                return clip
+    return None
 
 
 @dataclass(frozen=True)
@@ -200,13 +255,19 @@ class ImageRecord:
     def group_key(self) -> str:
         """The key used for grouped splitting.
 
-        Falls back to the image's own id when no group is set, which makes an
-        ungrouped dataset behave like a plain per-image split rather than
-        silently lumping every record into one bucket.
+        An explicit `group` always wins — that is the channel ingest uses to
+        state a clip identity that a bare image id cannot express, and the
+        channel `alpr.dupes` uses to merge perceptual duplicates.
+
+        Without one, the id is read as a filename: a recognised frame yields its
+        clip, and anything else is its own group. That makes an ungrouped
+        dataset behave like a per-image split rather than silently lumping every
+        record into one bucket.
         """
         if self.group is not None:
             return self.group
-        return _FRAME_SUFFIX.sub("", self.image_id) or self.image_id
+        base = strip_export_suffix(self.image_id)
+        return clip_id(base) or base or self.image_id
 
     @property
     def regions(self) -> set[Region]:
