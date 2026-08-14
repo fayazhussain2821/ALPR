@@ -40,6 +40,52 @@ from typing import Any
 # Splits and label bytes are what actually define the experiment.
 SPLITS = ("train", "val", "test")
 
+# macOS sidecar files that are not dataset content.
+#
+# An AppleDouble file carries the extended attributes of its sibling: `._a.txt`
+# belongs to `a.txt`. The name matters because `._a.txt` matches `*.txt`, so a
+# naive glob counts one label twice, doubles the annotation total, and — since
+# the bytes are a binary attribute blob beginning `Mac OS X ... ATTR` — feeds
+# garbage to any parser that opens it.
+#
+# They appear on the *destination* rather than the source: archiving on macOS
+# stores extended attributes alongside each file, and extracting on Linux
+# materialises them as real `._` files. So the dataset can be pristine and the
+# copy still wrong, which is exactly the case that has to be caught after a
+# transfer rather than before one.
+#
+# These are excluded by name, never by tolerating undecodable bytes. Decoding a
+# label with `errors="ignore"` would turn a corrupt transfer into a silently
+# smaller dataset, which is the failure this module exists to prevent.
+APPLEDOUBLE_PREFIX = "._"
+MACOS_METADATA_NAMES = frozenset({".DS_Store", "__MACOSX", ".Spotlight-V100", ".Trashes"})
+
+
+def is_macos_metadata(name: str) -> bool:
+    """True when a filename is macOS sidecar metadata rather than dataset content."""
+    return name.startswith(APPLEDOUBLE_PREFIX) or name in MACOS_METADATA_NAMES
+
+
+def find_macos_metadata(root: str | Path) -> list[str]:
+    """Every macOS metadata file under `root`, as paths relative to it.
+
+    Used to assert a transferred copy is clean. Returned sorted so a report is
+    stable, and as strings so it can go straight into a provenance record.
+    """
+    root = Path(root)
+    return sorted(
+        str(path.relative_to(root)) for path in root.rglob("*") if is_macos_metadata(path.name)
+    )
+
+
+def label_files(labels_dir: str | Path) -> list[Path]:
+    """The genuine YOLO label files in a directory, sorted.
+
+    `glob("*.txt")` alone also matches `._label.txt`, so this is the only way
+    label files should be enumerated anywhere in the package.
+    """
+    return sorted(p for p in Path(labels_dir).glob("*.txt") if not is_macos_metadata(p.name))
+
 
 class BaselineError(RuntimeError):
     """Raised when a baseline run must not proceed."""
@@ -65,7 +111,7 @@ def export_fingerprint(export_root: str | Path) -> str:
     export_root = Path(export_root)
     digest = hashlib.sha256()
     for split in SPLITS:
-        for label in sorted((export_root / "labels" / split).glob("*.txt")):
+        for label in label_files(export_root / "labels" / split):
             digest.update(f"{split}/{label.name}".encode())
             digest.update(label.read_bytes())
     return digest.hexdigest()
@@ -81,6 +127,9 @@ class DatasetFacts:
     export_sha256: str
     manifest_sha256: str | None = None
     manifest_records: int | None = None
+    # macOS sidecar files found under the export. Empty is the only acceptable
+    # value for a dataset that is about to be trained on.
+    macos_metadata: list[str] = field(default_factory=list)
 
     @property
     def total_images(self) -> int:
@@ -97,6 +146,10 @@ class DatasetFacts:
         if self.manifest_sha256:
             lines.append(f"manifest sha256  {self.manifest_sha256}")
             lines.append(f"manifest records {self.manifest_records}")
+        lines.append(
+            f"macOS metadata   {len(self.macos_metadata)}"
+            + ("" if not self.macos_metadata else f"  e.g. {self.macos_metadata[0]}")
+        )
         return "\n".join(lines)
 
 
@@ -112,16 +165,18 @@ def inspect_dataset(export_root: str | Path, manifest: str | Path | None = None)
         label_dir = export_root / "labels" / split
         if not label_dir.is_dir():
             raise BaselineError(f"missing label directory: {label_dir}")
-        # Counts symlinks and regular files alike; a dereferenced copy and the
-        # original must measure the same.
+        # Counts symlinks and regular files alike — a dereferenced copy and the
+        # original must measure the same — while excluding macOS sidecars.
         images[split] = (
-            sum(1 for p in image_dir.iterdir() if not p.name.startswith("."))
+            sum(1 for p in image_dir.iterdir() if not is_macos_metadata(p.name))
             if image_dir.is_dir()
             else 0
         )
-        label_files = sorted(label_dir.glob("*.txt"))
-        labels[split] = len(label_files)
-        for label in label_files:
+        found = label_files(label_dir)
+        labels[split] = len(found)
+        for label in found:
+            # Genuine YOLO labels are ASCII. No encoding fallback: a label that
+            # will not decode is a corrupt transfer and must surface as one.
             annotations += sum(1 for line in label.read_text().splitlines() if line.strip())
 
     manifest_sha = records = None
@@ -139,6 +194,7 @@ def inspect_dataset(export_root: str | Path, manifest: str | Path | None = None)
         export_sha256=export_fingerprint(export_root),
         manifest_sha256=manifest_sha,
         manifest_records=records,
+        macos_metadata=find_macos_metadata(export_root),
     )
 
 
@@ -155,8 +211,19 @@ def verify_dataset(
 
     Every mismatch is collected before raising, so a broken transfer reports all
     of its symptoms at once instead of one per attempt.
+
+    macOS sidecar files are always fatal, even when every count and hash still
+    matches. They mean the copy arrived through a path that rewrote it, and the
+    next tool to read the directory may not filter them as carefully as this one.
     """
     problems: list[str] = []
+
+    if facts.macos_metadata:
+        shown = ", ".join(facts.macos_metadata[:3])
+        problems.append(
+            f"{len(facts.macos_metadata)} macOS metadata file(s) present (e.g. {shown}) — "
+            "re-create the archive with COPYFILE_DISABLE=1 and --exclude='._*'"
+        )
 
     if facts.export_sha256 != export_sha256:
         problems.append(f"export sha256 {facts.export_sha256} != expected {export_sha256}")

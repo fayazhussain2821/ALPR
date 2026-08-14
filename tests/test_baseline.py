@@ -9,6 +9,7 @@ files on disk.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +17,10 @@ from alpr.baseline import (
     BaselineError,
     baseline_provenance,
     export_fingerprint,
+    find_macos_metadata,
     inspect_dataset,
+    is_macos_metadata,
+    label_files,
     sha256_file,
     verify_dataset,
     write_data_yaml,
@@ -110,6 +114,124 @@ class TestInspectDataset:
         root = make_export(tmp_path / "e")
         with pytest.raises(BaselineError, match="manifest not found"):
             inspect_dataset(root, tmp_path / "nope.jsonl")
+
+
+def add_appledouble(root):
+    """Drop a sidecar beside every real file, as a Linux extraction would.
+
+    The bytes are the real AppleDouble magic — a binary attribute blob, not
+    text — so anything that opens one as a label gets what it deserves.
+    """
+    blob = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        \x00\x02\x00\x00\x00\tATTR"
+    made = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.name.startswith("._"):
+            sidecar = path.with_name(f"._{path.name}")
+            sidecar.write_bytes(blob)
+            made.append(sidecar)
+    return made
+
+
+class TestAppleDoubleFiles:
+    """macOS sidecars must never be mistaken for dataset content.
+
+    `._label.txt` matches `*.txt`, so a naive glob counts one label twice and
+    doubles the annotation total. These files appear on the *destination*:
+    archiving on macOS carries extended attributes along, and extracting on
+    Linux materialises them as real files — so a pristine dataset can still
+    arrive contaminated.
+    """
+
+    def test_a_sidecar_is_not_a_label(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(2, 1, 1))
+        (root / "labels" / "train" / "._example.txt").write_bytes(b"Mac OS X\x00ATTR")
+        facts = inspect_dataset(root)
+        assert facts.labels["train"] == 2, "an AppleDouble file was counted as a label"
+
+    def test_annotations_are_not_inflated(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(2, 1, 1), boxes_per_image=1)
+        add_appledouble(root)
+        assert inspect_dataset(root).annotations == 4
+
+    def test_a_sidecar_is_not_an_image(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(2, 1, 1))
+        (root / "images" / "train" / "._example.jpg").write_bytes(b"Mac OS X\x00ATTR")
+        assert inspect_dataset(root).images["train"] == 2
+
+    def test_the_fingerprint_ignores_them(self, tmp_path):
+        # Identity must survive a contaminated transfer, or the hash could never
+        # tell "wrong dataset" apart from "same dataset, bad copy".
+        root = make_export(tmp_path / "e")
+        before = export_fingerprint(root)
+        add_appledouble(root)
+        assert export_fingerprint(root) == before
+
+    def test_they_are_found_and_listed(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(1, 1, 1))
+        made = add_appledouble(root)
+        found = find_macos_metadata(root)
+        assert len(found) == len(made)
+        assert all(Path(f).name.startswith("._") for f in found)
+
+    def test_verify_rejects_them_even_when_everything_else_matches(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(2, 1, 1))
+        clean = inspect_dataset(root)
+        add_appledouble(root)
+        dirty = inspect_dataset(root)
+        # Counts and hash are still correct — only the sidecars differ.
+        assert dirty.export_sha256 == clean.export_sha256
+        assert dirty.labels == clean.labels
+        with pytest.raises(BaselineError, match="macOS metadata file"):
+            verify_dataset(
+                dirty,
+                export_sha256=clean.export_sha256,
+                counts={"train": 2, "val": 1, "test": 1},
+                annotations=4,
+            )
+
+    def test_the_error_says_how_to_fix_it(self, tmp_path):
+        root = make_export(tmp_path / "e")
+        add_appledouble(root)
+        with pytest.raises(BaselineError) as exc:
+            verify_dataset(inspect_dataset(root), export_sha256="0" * 64)
+        assert "COPYFILE_DISABLE=1" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        ("name", "is_metadata"),
+        [
+            ("._example.txt", True),
+            ("._eu-test-plate_jpg.rf.abc123.txt", True),
+            (".DS_Store", True),
+            ("__MACOSX", True),
+            ("example.txt", False),
+            ("eu-test-plate_jpg.rf.abc123.txt", False),
+            # A real label may legitimately contain "._" without starting with it.
+            ("clip._frame.txt", False),
+        ],
+    )
+    def test_classification(self, name, is_metadata):
+        assert is_macos_metadata(name) is is_metadata
+
+    def test_label_files_is_the_only_safe_enumerator(self, tmp_path):
+        root = make_export(tmp_path / "e", counts=(2, 1, 1))
+        (root / "labels" / "train" / "._example.txt").write_bytes(b"Mac OS X")
+        raw = sorted((root / "labels" / "train").glob("*.txt"))
+        safe = label_files(root / "labels" / "train")
+        assert len(raw) == 3, "fixture should have produced a sidecar"
+        assert len(safe) == 2
+        assert all(not p.name.startswith("._") for p in safe)
+
+    def test_a_genuinely_undecodable_label_still_raises(self, tmp_path):
+        # Guards against 'fixing' this with errors="ignore" or latin-1: a real
+        # label full of binary must fail loudly, not decode to nonsense and
+        # quietly shrink the dataset.
+        root = make_export(tmp_path / "e", counts=(1, 1, 1))
+        (root / "labels" / "train" / "train_0.txt").write_bytes(b"\xff\xfe\x00\x01binary")
+        with pytest.raises(UnicodeDecodeError):
+            inspect_dataset(root)
+
+    def test_a_clean_export_reports_no_metadata(self, tmp_path):
+        assert inspect_dataset(make_export(tmp_path / "e")).macos_metadata == []
 
 
 class TestVerifyDataset:
